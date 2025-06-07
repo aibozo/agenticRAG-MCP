@@ -1,0 +1,72 @@
+# Ignore patterns for AgenticRAG indexing
+# This file follows .gitignore syntax
+
+# Version control
+.git/
+.svn/
+.hg/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.dll
+*.dylib
+
+# Dependencies
+node_modules/
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large binary files
+*.zip
+*.tar
+*.gz
+*.rar
+*.7z
+*.exe
+*.dmg
+*.iso
+*.jar
+
+# Media files
+*.mp4
+*.mp3
+*.wav
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.ico
+*.svg
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Project specific
+chroma_db/
+.mcp/
+tmp/

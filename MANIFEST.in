@@ -1,0 +1,22 @@
+include README.md
+include LICENSE
+include requirements.txt
+include .env.example
+include install.sh
+include uninstall.sh
+include quickstart.sh
+include test_installation.py
+include mcp_launcher.py
+recursive-include src *.py
+recursive-include docs *.md
+exclude .env
+exclude claude_config_snippet.json
+prune venv
+prune chroma_db
+prune logs
+prune .mcp
+prune __pycache__
+prune .pytest_cache
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude .DS_Store

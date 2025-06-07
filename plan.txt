@@ -1,0 +1,241 @@
+Below is a **from-scratch “blueprint”** for a Python-based **agentic RAG MCP (Memory & Codebase-Processing) server** exactly as you described.  Think of it as the scaffolding you’ll flesh out module-by-module; the order is intentionally linear so you can build, test, and harden each stage before moving on.
+
+---
+
+## 0  Goals (Why we’re doing this)
+
+* **Give Claude (planning/UX) a single function**—`init_repo(path)`—that turns any directory into an indexed knowledge space.
+* **Let GPT-4.1 do the dirty work** (chunking, embedding, summarising, self-critiquing).
+* **Return *only* distilled, high-leverage context** back to Claude so its window stays clean.
+* **Keep everything agentic**: every step is a tool-call chosen by an LLM, not a hard-wired pipeline.
+* **Be production-runnable on a single node** but ready to scale (vector DB, message bus, autoscaling workers).
+
+---
+
+## 1  Core Tech Stack
+
+| Layer              | Choice                                                              | Rationale                                                                                               |
+| ------------------ | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Orchestration      | **LangGraph** (or bare-bones agent loop)                            | Built-in support for multi-agent control-flow and retries. ([langchain-ai.github.io][1])                |
+| LLMs               | **OpenAI GPT-4.1** (retrieval/summary)  + **Claude 3** (planner/UX) | 4.1’s million-token window & better needle retrieval, Claude’s longer-form reasoning. ([openai.com][2]) |
+| Embeddings         | `text-embedding-3-large`                                            | Matches 4.1 tokeniser; cheap at scale.                                                                  |
+| Vector store       | **Chroma** (local) → later **Weaviate/PGVector**                    | Simple to start; cluster-ready later.                                                                   |
+| API server         | **FastAPI + Uvicorn**                                               | Async, typed, OpenAPI docs for free.                                                                    |
+| Messaging / queues | **Redis Streams** (dev) → **NATS/Kafka** (prod)                     | For async agent tasks.                                                                                  |
+| Secrets            | `.env` + **Doppler**/`aws-secretsmanager` in prod                   | Never bake keys into images.                                                                            |
+| DevOps             | **Docker-compose** → Helm chart                                     | Mirrors the phased approach you used in earlier modules.                                                |
+
+---
+
+## 2  High-Level Architecture
+
+```text
++-------------+            +-------------------+           +------------------+
+|  Claude 3   |  <--REST--> |  MCP Server (API) | <--gRPC--> | Worker Pool      |
+|  (Planner)  |            |  FastAPI + LangGraph |         | (GPT-4.1 agents) |
++-------------+            +-------------------+           +------------------+
+       ^                            |                                 |
+       |   distilled context        |  Redis/NATS jobs & results      |
+       |                            v                                 v
+  (chat UI)                  +----------------+               +-------------------+
+                             | Vector Store   |<---chunks------|  Repo Watcher     |
+                             | (Chroma etc.)  |               | (fsnotify/git)    |
+                             +----------------+               +-------------------+
+```
+
+**Flow** (happy path):
+
+1. **`init_repo` tool** called by Claude → MCP spawns a *RepoIndex* job.
+2. *RepoIndex worker* walks the directory (honours `.agenticragignore`, `.gitignore`), chunks files, embeds, stores `<vector, metadata>` rows, and writes a manifest JSON.
+3. For each *user query* (or Claude’s internal analysis step) MCP spins an **agentic loop**:
+   a. GPT-4.1 forms a search query → vector store returns top-k chunks.
+   b. GPT-4.1 critiques coverage; if unsatisfied it reformulates and re-searches (loop capped).
+   c. Final answer is *compressed* (bullet summary + citations) and returned to Claude.
+4. MCP logs token usage & timing for cost control (hooks into the telemetry module you scoped in Phase 10).
+
+---
+
+## 3  Detailed Build Plan
+
+### Phase A  — Bootstrap repo & environment
+
+1. **Scaffold project**
+
+   ```bash
+   mkdir agenticrag-mcp && cd $_
+   poetry init  # or pipx + requirements.txt
+   touch .env.example docker-compose.yml README.md
+   ```
+2. Pin key deps:
+
+   ```toml
+   openai~=1.15
+   anthropic
+   chromadb~=0.4
+   langgraph
+   fastapi uvicorn redis[worker]
+   python-dotenv pydantic
+   watchdog    # file-system events
+   ```
+3. Decide on **chunker** (e.g., `tiktoken` + newline splitter) and expose params in `config.toml`.
+
+### Phase B  — RepoIndex tool
+
+* **Signature**:
+
+  ```python
+  def init_repo(path: str, repo_name: str, ignore_globs: list[str] = None) -> str
+  ```
+* Steps inside worker:
+
+  1. Walk FS, skip binary >2 MB, apply ignore globs.
+  2. For each file: read → split into \~1280-token chunks w/ 50-token overlap.
+  3. Call `openai.embeddings.create` (batch).
+  4. Upsert rows `{id, repo, file_path, start_line, end_line, content, embedding}`.
+  5. Write manifest `repo_name/.mcp/manifest.json`, include git commit hash & chunking params for reproducibility.
+  6. Return manifest path to caller.
+
+### Phase C  — Agent loop (“Fetch-Critique-Refine”)
+
+1. **Planner** (Claude) passes natural-language task + desired repo(s).
+2. **Retriever Agent** (GPT-4.1) is prompted with:
+
+   * task
+   * repo manifest metadata
+   * *function schema*: `search_repo(query: str, repo: str, k: int) -> List[Chunk]`
+3. Agent emits `search_repo` calls (function-calling) until its *self-evaluation* string returns `"sufficient_context": true`.
+   *Self-evaluation* pattern is from typical agentic RAG designs ([vellum.ai][3], [microsoft.github.io][4])
+4. **Compressor Agent** turns N chunks → “Key insights” (≤ 4 kb) using map-reduce summaries.
+5. MCP funnels compressor output + provenance back to Claude.
+
+### Phase D  — API & Auth
+
+* **Endpoints**
+
+  * `POST /init` – call `init_repo`
+  * `POST /query` – body `{question, repo, max_iters}`
+  * `GET /costs` – returns last-24h token usage by repo & model
+* **Auth**: start with bearer token in `.env`, swap to HMAC header in prod.
+
+### Phase E  — Live-update & CI hooks
+
+* FS watcher listens for modified files -> triggers delta-indexing workers.
+* Git pre-push hook can hit `/init` with `diff --name-only` list.
+
+### Phase F  — Telemetry & Cost Control (plugs into your Phase 10 module)
+
+1. Middleware captures `x-openai-processing-ms` & token counts from HTTP response headers.
+2. Publish to Prometheus via OpenTelemetry; set alert rules for daily budget.
+
+### Phase G  — Testing
+
+* Unit: chunker edge cases, embedding batch sizes, vector similarity.
+* Integration: spin up sample repo, assert that `query` answers “What port does FastAPI run on?” correctly.
+* Load: Locust script hitting `/query` at 20 RPS; watch latency & redis queue depth.
+
+### Phase H  — Deployment
+
+* **Dev**: `docker-compose up` (api, redis, chroma).
+* **Prod**: Build multi-arch image, push to registry, deploy with Helm; use horizontal pod autoscaler on queue length.
+
+---
+
+## 4  Security & Governance Checklist
+
+* `.env` never committed; CI fails if keys detected.
+* File-type allow-list (no private keys, envs, `.pem`, large binaries).
+* Access log per repo, per requester.
+* Optionally encrypt embeddings at rest (Chroma supports AES key).
+* Rate-limit user queries to avoid model jail-break amplification.
+
+---
+
+## 5  Additional Implementation Details
+
+### Error Handling & Resilience
+* **Retry logic**: Exponential backoff for OpenAI/Anthropic API calls with jitter
+* **Circuit breaker**: Fail fast when APIs are down to preserve credits
+* **Graceful degradation**: Fall back to keyword search if embeddings fail
+* **Queue persistence**: Redis AOF to survive worker crashes
+* **Idempotent indexing**: Use content hash as chunk ID to avoid duplicates
+
+### Performance Optimizations
+* **Batch embedding**: Process 100 chunks per API call (OpenAI limit)
+* **Concurrent file processing**: Use asyncio for I/O-bound operations
+* **Smart chunking**: Respect code boundaries (function/class definitions)
+* **Incremental updates**: Only re-embed changed files (git diff awareness)
+* **Cache layer**: Redis for frequent queries (24h TTL)
+
+### Data Schema Details
+```python
+# Vector store metadata schema
+chunk_metadata = {
+    "id": "sha256_hash_of_content",
+    "repo_name": "agenticRAG",
+    "file_path": "/src/main.py",
+    "start_line": 42,
+    "end_line": 87,
+    "chunk_index": 3,
+    "total_chunks": 12,
+    "language": "python",
+    "last_modified": "2024-01-15T10:30:00Z",
+    "git_commit": "abc123def",
+    "chunk_strategy": "semantic_boundaries_v1",
+    "token_count": 1280
+}
+
+# Manifest schema
+manifest = {
+    "repo_name": "agenticRAG",
+    "indexed_at": "2024-01-15T10:30:00Z",
+    "total_files": 234,
+    "total_chunks": 5678,
+    "total_tokens": 7.2e6,
+    "chunking_params": {
+        "strategy": "semantic_boundaries_v1",
+        "max_tokens": 1280,
+        "overlap_tokens": 50
+    },
+    "ignore_patterns": [".git", "__pycache__", "*.pyc"],
+    "git_ref": "main/abc123def",
+    "index_version": "1.0.0"
+}
+```
+
+### Agent Prompts & Instructions
+* **Retriever Agent**: Focus on code understanding, include surrounding context
+* **Compressor Agent**: Preserve technical accuracy while reducing tokens
+* **Self-evaluation criteria**: Coverage, relevance, contradictions, gaps
+
+### Cost Management
+* **Token budgets**: Per-query limits (10k retrieval, 5k compression)
+* **Model selection**: Use gpt-4o-mini for simple queries, gpt-4o for complex
+* **Embedding cache**: Store popular queries to avoid re-computation
+* **Usage alerts**: Webhook to Slack when 80% of daily budget consumed
+
+---
+
+## 6  Stretch Improvements
+
+| Idea                                                 | Hook-in point                                           |
+| ---------------------------------------------------- | ------------------------------------------------------- |
+| **Code graphs** (AST-level edges) for smarter search | Extend RepoIndex to store function-level embeddings.    |
+| **Change-aware summarisation**                       | Diff-only re-summaries on git commits.                  |
+| **QA eval harness**                                  | Synthetic question set auto-graded by GPT-4.1 critique. |
+| **IDE extension**                                    | VS Code panel calling `/query` under the hood.          |
+| **Federated repos**                                  | Multi-tenant Chroma namespaces + JWT auth.              |
+
+---
+
+### You now have:
+
+* A **phased roadmap** you can start coding today.
+* Clear interfaces for Claude ↔ MCP ↔ GPT-4.1.
+* Guard-rails for cost, security, and future scaling.
+
+Ping me when you’re ready to dive into Phase A and we’ll flesh out the exact code scaffolding.
+
+[1]: https://langchain-ai.github.io/langgraph/concepts/agentic_concepts/?utm_source=chatgpt.com "Agent architectures - Overview"
+[2]: https://openai.com/index/gpt-4-1/?utm_source=chatgpt.com "Introducing GPT-4.1 in the API - OpenAI"
+[3]: https://www.vellum.ai/blog/agentic-rag?utm_source=chatgpt.com "Agentic RAG: Architecture, Use Cases, and Limitations - Vellum AI"
+[4]: https://microsoft.github.io/ai-agents-for-beginners/05-agentic-rag/?utm_source=chatgpt.com "ai-agents-for-beginners - Microsoft Open Source"

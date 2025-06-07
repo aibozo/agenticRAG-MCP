@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "agenticrag": {
+      "command": "python3",
+      "args": [
+        "/home/riley/Programming/agenticRAG/mcp_launcher.py"
+      ],
+      "env": {
+        "OPENAI_API_KEY": "",
+        "ANTHROPIC_API_KEY": ""
+      }
+    }
+  }
+}
