@@ -16,7 +16,7 @@ An intelligent codebase processing server that provides agentic RAG (Retrieval-A
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/agenticrag-mcp.git
+git clone https://github.com/aibozo/agenticrag-mcp.git
 cd agenticrag-mcp
 
 # Run the installation script
